@@ -6,6 +6,8 @@ import { privateKeyToAccount } from "viem/accounts";
 import { withPaymentInterceptor } from "x402-axios";
 import { config } from "dotenv";
 import { openApiSchema } from "./context/open-api-schema.js";
+import * as z from "zod";
+
 
 // Load environment variables and throw an error if any are missing
 config();
@@ -30,30 +32,39 @@ const server = new McpServer({
   version: "1.0.0",
 });
 
-// Helper function to convert OpenAPI parameter schema to MCP tool parameter schema
-function convertParameterSchema(param: any): any {
-  const schema: any = {};
+// Helper function to convert OpenAPI parameter schema to Zod schema
+function convertParameterToZod(param: any): z.ZodTypeAny {
+  const schema = param.schema;
   
-  if (param.schema.type === 'integer') {
-    schema.type = 'integer';
-    if (param.schema.minimum !== undefined) schema.minimum = param.schema.minimum;
-    if (param.schema.maximum !== undefined) schema.maximum = param.schema.maximum;
-    if (param.schema.default !== undefined) schema.default = param.schema.default;
-  } else if (param.schema.type === 'number') {
-    schema.type = 'number';
-    if (param.schema.minimum !== undefined) schema.minimum = param.schema.minimum;
-    if (param.schema.maximum !== undefined) schema.maximum = param.schema.maximum;
-    if (param.schema.default !== undefined) schema.default = param.schema.default;
-  } else if (param.schema.type === 'boolean') {
-    schema.type = 'boolean';
-    if (param.schema.default !== undefined) schema.default = param.schema.default;
-  } else if (param.schema.type === 'string') {
-    schema.type = 'string';
-    if (param.schema.enum) schema.enum = param.schema.enum;
-    if (param.schema.default !== undefined) schema.default = param.schema.default;
+  if (schema.type === 'integer') {
+    let zodSchema: z.ZodTypeAny = z.number().int();
+    if (schema.minimum !== undefined) zodSchema = (zodSchema as z.ZodNumber).min(schema.minimum);
+    if (schema.maximum !== undefined) zodSchema = (zodSchema as z.ZodNumber).max(schema.maximum);
+    if (schema.default !== undefined) zodSchema = zodSchema.default(schema.default);
+    return zodSchema;
+  } else if (schema.type === 'number') {
+    let zodSchema: z.ZodTypeAny = z.number();
+    if (schema.minimum !== undefined) zodSchema = (zodSchema as z.ZodNumber).min(schema.minimum);
+    if (schema.maximum !== undefined) zodSchema = (zodSchema as z.ZodNumber).max(schema.maximum);
+    if (schema.default !== undefined) zodSchema = zodSchema.default(schema.default);
+    return zodSchema;
+  } else if (schema.type === 'boolean') {
+    let zodSchema: z.ZodTypeAny = z.boolean();
+    if (schema.default !== undefined) zodSchema = zodSchema.default(schema.default);
+    return zodSchema;
+  } else if (schema.type === 'string') {
+    let zodSchema: z.ZodTypeAny;
+    if (schema.enum) {
+      zodSchema = z.enum(schema.enum as [string, ...string[]]);
+    } else {
+      zodSchema = z.string();
+    }
+    if (schema.default !== undefined) zodSchema = zodSchema.default(schema.default);
+    return zodSchema;
   }
   
-  return schema;
+  // Fallback to any if type is unknown
+  return z.any();
 }
 
 // Register tools for all endpoints in the OpenAPI schema
@@ -66,28 +77,21 @@ for (const [path, pathItem] of Object.entries(openApiSchema.paths)) {
   const description = getOperation.description || summary;
   const parameters = getOperation.parameters || [];
   
-  // Build parameter schema for MCP tool
-  const properties: Record<string, any> = {};
-  const required: string[] = [];
+  // Build Zod schema for MCP tool
+  const zodProperties: Record<string, z.ZodTypeAny> = {};
   
   for (const param of parameters) {
     if (param.in === 'query') {
-      properties[param.name] = {
-        ...convertParameterSchema(param),
-        description: param.description,
-      };
+      let zodSchema = convertParameterToZod(param);
+      if (param.description) {
+        zodSchema = zodSchema.describe(param.description);
+      }
       if (param.required) {
-        required.push(param.name);
+        zodProperties[param.name] = zodSchema;
+      } else {
+        zodProperties[param.name] = zodSchema.optional();
       }
     }
-  }
-  
-  const toolSchema: any = {
-    type: 'object',
-    properties,
-  };
-  if (required.length > 0) {
-    toolSchema.required = required;
   }
   
   // Register the tool
@@ -96,7 +100,7 @@ for (const [path, pathItem] of Object.entries(openApiSchema.paths)) {
     {
       title: summary,
       description: description,
-      inputSchema: toolSchema,
+      inputSchema: zodProperties,
     },
     async (args: any) => {
       // Build query string from parameters
